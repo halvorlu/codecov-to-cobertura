@@ -67,7 +67,7 @@ def add_missing_files(classes, source_path):
             full_path = os.path.join(root, filename)
             all_files.append(os.path.relpath(full_path))
     for filepath in all_files:
-        if filepath not in found_files and is_fortran(filepath):
+        if filepath not in found_files and is_source_file(filepath):
             classes.append(empty_class(filepath))
 
 
@@ -82,12 +82,10 @@ def empty_class(filepath):
     return class_elem
 
 
-def is_fortran(filepath):
-    """Return True if given filename is a fortran file."""
-    if re.search(r"\.(f|f90)$", filepath, flags=re.IGNORECASE):
-        return True
-    else:
-        return False
+def is_source_file(filepath):
+    """Return True if given filename is a Fortran or C/C++ file."""
+    suffixes = [".f", ".f90", ".c", ".cpp"]
+    return os.path.splitext(filepath.lower())[-1] in suffixes
 
 
 def module_in_source(module, source_path):
@@ -119,9 +117,11 @@ def add_missing_methods(class_elem, object_path):
     objectname = os.path.splitext(filename)[0] + ".o"
     object_file_path = find_in_dir(objectname, object_path)
     file_methods = methods_in_file(object_file_path)
+    logging.debug("Methods in %s: %s", objectname, file_methods)
     node_methods = class_elem.find("methods")
     found_methods = [method.get("name")
                      for method in node_methods.findall("method")]
+    logging.debug("Called methods in %s: %s", objectname, found_methods)
     for method in file_methods:
         if method not in found_methods:
             try:
@@ -137,6 +137,7 @@ def uncalled_method(name, filename):
                                        "line-rate": "0",
                                        "signature": ""})
     start_line, end_line = function_line_span(filename, name)
+    logging.debug("Method %s spans lines %d-%d", name, start_line, end_line)
     lines = Element("lines")
     for lineno in executable_lines(filename, start_line, end_line):
         lines.append(Element("line",
@@ -146,7 +147,27 @@ def uncalled_method(name, filename):
 
 
 def function_line_span(filename, function):
-    """Return the start/end line number of the given function."""
+    """Return the start/end line number of the given function (signature)."""
+    suffix = os.path.splitext(filename)[-1].lower()
+    if suffix in [".f", ".f90"]:
+        return fortran_line_span(filename, function)
+    else:
+        return c_line_span(filename, function)
+
+
+def c_line_span(filename, function):
+    """Return the start/end line number of the given function signature."""
+    functionname = function.split("(")[0]
+    functionname = functionname.replace("::", r"\s*::\s*")
+    functionname = functionname.replace("<", r"\s<\s")
+    functionname = functionname.replace(">", r"\s>\s")
+    re_obj = re.compile(r"^[^(//)\"']*\s" + functionname)
+    start_line = match_line_number(filename, re_obj)
+    return start_line, start_line
+
+
+def fortran_line_span(filename, function):
+    """Return the start/end line number of the given Fortran function."""
     re_obj = re.compile(r"^[^!\"']* (subroutine|function) " + function,
                         flags=re.IGNORECASE)
     start_line = match_line_number(filename, re_obj)
@@ -300,7 +321,7 @@ def methods_in_file(filename):
     import subprocess
     try:
         nm_out = subprocess.check_output(["nm", "--defined-only",
-                                          "-g", filename],
+                                          "--demangle", filename],
                                          stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError:
         logging.warning("nm failed to find methods in %s", filename)
@@ -325,14 +346,15 @@ def is_nm_function(nm_line):
     parts = nm_line.split()
     if parts[2].endswith("._"):
         return False
-#    if "___" in parts[2]:
-#        return False
-    type_letter = nm_line.split()[-2]
-    return type_letter == "T"
+    if parts[2].startswith("__"):
+        return False
+    type_letter = parts[-2]
+    valid_letters = ["T", "t", "W", "w"]
+    return type_letter in valid_letters
 
 
 def function_name_from_nm_line(nm_line):
-    """Return function name from nm line, without module name."""
+    """Return function name/signature from nm line, without module name."""
     function_name = nm_line.split()[-1]
     if function_name.find("_MOD_") != -1:
         function_name = function_name.split("_MOD_")[-1]
@@ -361,7 +383,12 @@ if __name__ == "__main__":
                         must be reported to reside in a different directory \
                         in order for Jenkins to distinguish between two XML \
                         files.', default=None)
+    parser.add_argument('--verbose', help='Verbose output for debugging.',
+                        dest='verbose', action='store_true')
+    parser.set_defaults(verbose=False)
     args = parser.parse_args()
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
     if args.out_src_path is None:
         args.out_src_path = args.source_path
     main(args.from_file, args.to_file, args.object_path, args.source_path,
