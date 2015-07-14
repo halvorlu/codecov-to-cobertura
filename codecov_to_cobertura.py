@@ -3,30 +3,35 @@
 A python script to produce Cobertura XML from Intel's codecov XML.
 """
 from xml.etree.ElementTree import ElementTree, Element
+import os
 import os.path
 import re
+import logging
+logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
 
 
 def main(from_file, to_file, object_path, source_path, out_source_path):
-    """Produce Cobertura XML from Intel's codecov XML.
+    """Produce Cobertura XML from Intel's codecov XML (for Fortran).
 
     from_file: XML file produced by Intel's codecov
     to_file: XML file to be written
     object_path: Relative path to directory with object files
     source_path: Relative path to directory with source files"""
+    root_path = os.getcwd()
+    abs_src_path = os.path.join(root_path, source_path)
     root = root_from_file(from_file)
     project_name = root.get("name", "")
     classes = Element("classes")
     for module in root.findall("MODULE"):
-        if not module_in_source(module, source_path):
+        if not module_in_source(module, abs_src_path):
             continue
-        class_elem = module_to_class(module, source_path)
+        class_elem = module_to_class(module, root_path)
         classes.append(class_elem)
     add_missing_files(classes, source_path)
     for class_elem in classes.findall("class"):
         add_missing_methods(class_elem, object_path)
         create_lines(class_elem)
-        replace_source_path(class_elem, out_source_path)
+        replace_source_path(class_elem, source_path, out_source_path)
     total_branch_rate = str(calc_total_branch_rate(root.iter("BLOCKS")))
     package = Element("package", attrib={"branch-rate": total_branch_rate,
                                          "name": project_name})
@@ -40,26 +45,28 @@ def main(from_file, to_file, object_path, source_path, out_source_path):
     new_root.append(packages)
     new_tree = ElementTree(new_root)
     with open(to_file, 'w') as fileobj:
-        fileobj.write("<?xml version=\"1.0\" ?><!DOCTYPE coverage SYSTEM 'http://cobertura.sourceforge.net/xml/coverage-03.dtd'>")
+        fileobj.write("<?xml version=\"1.0\" ?><!DOCTYPE coverage SYSTEM "
+                      "'http://cobertura.sourceforge.net"
+                      "/xml/coverage-03.dtd'>")
         new_tree.write(fileobj)
 
 
-def replace_source_path(class_elem, new_path):
+def replace_source_path(class_elem, old_path, new_path):
     """Replace the source path in the given class element."""
-    oldfile = os.path.basename(class_elem.get("filename"))
-    new_file_path = os.path.join(new_path, oldfile)
+    rel_path = os.path.relpath(class_elem.get("filename"), old_path)
+    new_file_path = os.path.join(new_path, rel_path)
     class_elem.set("filename", new_file_path)
 
 
 def add_missing_files(classes, source_path):
     """Add class element for files in source_path that are missing."""
-    from os import listdir
-    from os.path import isfile, join
     found_files = [x.get("filename") for x in classes.findall("class")]
-    all_files = [f for f in listdir(source_path)
-                 if isfile(join(source_path, f))]
-    for filename in all_files:
-        filepath = join(source_path, filename)
+    all_files = []
+    for root, directories, filenames in os.walk(source_path):
+        for filename in filenames:
+            full_path = os.path.join(root, filename)
+            all_files.append(os.path.relpath(full_path))
+    for filepath in all_files:
         if filepath not in found_files and is_fortran(filepath):
             classes.append(empty_class(filepath))
 
@@ -107,10 +114,10 @@ def unix_timestamp():
 
 def add_missing_methods(class_elem, object_path):
     """Add missing methods to given class node, using given object path."""
-    filename = class_elem.get("filename")
-    basename = os.path.basename(filename)
-    object_file = basename.split(".")[0] + ".o"
-    object_file_path = os.path.join(object_path, object_file)
+    source_path = class_elem.get("filename")
+    filename = os.path.basename(source_path)
+    objectname = os.path.splitext(filename)[0] + ".o"
+    object_file_path = find_in_dir(objectname, object_path)
     file_methods = methods_in_file(object_file_path)
     node_methods = class_elem.find("methods")
     found_methods = [method.get("name")
@@ -118,9 +125,9 @@ def add_missing_methods(class_elem, object_path):
     for method in file_methods:
         if method not in found_methods:
             try:
-                node_methods.append(uncalled_method(method, filename))
+                node_methods.append(uncalled_method(method, source_path))
             except Exception as e:
-                print "Warning: " + str(e)
+                logging.warning("Warning: %s", str(e))
 
 
 def uncalled_method(name, filename):
@@ -140,10 +147,10 @@ def uncalled_method(name, filename):
 
 def function_line_span(filename, function):
     """Return the start/end line number of the given function."""
-    re_obj = re.compile(r"^[^!]*(subroutine|function) "+function,
+    re_obj = re.compile(r"^[^!\"']* (subroutine|function) " + function,
                         flags=re.IGNORECASE)
     start_line = match_line_number(filename, re_obj)
-    re_obj = re.compile(r"^[^!]*end (subroutine|function)",
+    re_obj = re.compile(r"^[^!]*(end (subroutine|function)|contains)",
                         flags=re.IGNORECASE)
     end_line = match_line_number(filename, re_obj, start_line+1)
     return start_line, end_line
@@ -172,9 +179,10 @@ NON_COMMENT_PATTERN = re.compile(r"^\s*[a-z]+", flags=re.IGNORECASE)
 USE_PATTERN = re.compile(r"^\s*use [a-z]+", flags=re.IGNORECASE)
 CONT_PATTERN = re.compile(r".*&\s*$")
 VAR_PATTERN = re.compile(r"[^!]*::")
-END_PATTERN = re.compile(r"\s*(end\s*do|end\s*if|end\s*select)")
+END_PATTERN = re.compile(r"\s*end\s*(do|if|select|function|subroutine)")
 IMPLICIT_PATTERN = re.compile(r"\s*implicit ")
 ELSE_PATTERN = re.compile(r"\s*else ")
+CONTAINS_PATTERN = re.compile(r"\s*contains")
 
 
 def is_executable_line(line, prev_line=''):
@@ -186,7 +194,8 @@ def is_executable_line(line, prev_line=''):
        and not VAR_PATTERN.match(line) \
        and not END_PATTERN.match(line) \
        and not IMPLICIT_PATTERN.match(line) \
-       and not ELSE_PATTERN.match(line):
+       and not ELSE_PATTERN.match(line) \
+       and not CONTAINS_PATTERN.match(line):
         return True
     else:
         return False
@@ -219,10 +228,10 @@ def calc_total_branch_rate(blocks):
         return 0
 
 
-def module_to_class(module, source_path):
+def module_to_class(module, root_path):
     """Convert MODULE element to a class element."""
     module_path = module.get("name", "unknown")
-    module_name = os.path.join(source_path, module_path.split("/")[-1])
+    module_name = os.path.relpath(module_path, root_path)
     branch_rate = str(calc_total_branch_rate(module.iter("BLOCKS")))
     class_elem = Element("class", attrib={"name": module_name,
                                           "branch-rate": branch_rate,
@@ -294,12 +303,21 @@ def methods_in_file(filename):
                                           "-g", filename],
                                          stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError:
+        logging.warning("nm failed to find methods in %s", filename)
         return []
     functions = []
     for line in nm_out.splitlines():
         if is_nm_function(line):
             functions.append(function_name_from_nm_line(line))
     return functions
+
+
+def find_in_dir(name, path):
+    """Recursively find file name in given path and return full path."""
+    for root, dirs, files in os.walk(path):
+        if name in files:
+            return os.path.join(root, name)
+    raise Exception("Object file %s not found in %s" % (name, path))
 
 
 def is_nm_function(nm_line):
@@ -326,8 +344,9 @@ def function_name_from_nm_line(nm_line):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Convert from Intel's "
-                                     + "codecov XML format to Cobertura "
-                                     + "XML format.")
+                                     "codecov XML format to Cobertura "
+                                     "XML format. Should be run in"
+                                     "project's root folder.")
     parser.add_argument('from_file',
                         help='Name of codecov XML file')
     parser.add_argument('source_path',
