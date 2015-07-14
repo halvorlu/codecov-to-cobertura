@@ -16,6 +16,6 @@ For more description of the command-line arguments to `codecov_to_cobertura.py`,
 
 ## Notes
 
-* Has only been tested on Linux and for Fortran files.
+* Has only been tested on Linux.
 * Uses `nm` to list symbols in object files.
 * Use at your own risk.
